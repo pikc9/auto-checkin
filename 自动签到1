@@ -1,0 +1,149 @@
+name: Auto Checkin
+
+on:
+  schedule:
+    - cron: '30 23 * * *'
+    - cron: '30 0 * * *'
+    - cron: '30 1 * * *'
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm install playwright
+          npx playwright install chromium
+          npx playwright install-deps chromium
+
+      - name: Run Checkin
+        env:
+          CHECKIN_SITES: ${{ secrets.CHECKIN_SITES }}
+        run: |
+          node << 'EOF'
+          const { chromium } = require('playwright');
+          
+          const SITES = JSON.parse(process.env.CHECKIN_SITES || '[]');
+          
+          async function main() {
+            console.log('🚀 自动签到...');
+            console.log(`⏰ 北京时间 ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+            
+            let success = 0;
+            let failed = 0;
+            
+            const browser = await chromium.launch({
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--window-size=1920,1080'
+              ]
+            });
+            
+            for (const site of SITES) {
+              console.log(`\n📌 ${site.name}  ${site.url}`);
+              
+              try {
+                const context = await browser.newContext({
+                  viewport: { width: 1920, height: 1080 },
+                  locale: 'zh-CN',
+                  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  extraHTTPHeaders: {
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                  }
+                });
+                
+                const page = await context.newPage();
+                
+                await page.goto(site.url + '/login', { timeout: 60000, waitUntil: 'domcontentloaded' });
+                await page.waitForTimeout(5000);
+                
+                const title = await page.title();
+                console.log(`📄 页面标题: ${title}`);
+                
+                if (title.includes('Just a moment')) {
+                  console.log('⚠️ Cloudflare 验证中，等待...');
+                  await page.waitForTimeout(15000);
+                }
+                
+                const emailInput = await page.$('input[type="email"]');
+                const userInput = await page.$('input[placeholder*="邮箱"], input[placeholder*="账号"], input[name="username"]');
+                const passInput = await page.$('input[type="password"]');
+                
+                if (emailInput) {
+                  await emailInput.fill(site.username);
+                } else if (userInput) {
+                  await userInput.fill(site.username);
+                }
+                
+                if (passInput) {
+                  await passInput.fill(site.password);
+                }
+                
+                await page.waitForTimeout(1000);
+                
+                const submitBtn = await page.$('button[type="submit"]');
+                if (submitBtn) {
+                  await submitBtn.click();
+                  console.log('🔄 点击登录...');
+                }
+                
+                await page.waitForTimeout(8000);
+                
+                const userInfo = await page.evaluate(() => {
+                  try {
+                    const user = localStorage.getItem('user');
+                    return user ? JSON.parse(user) : null;
+                  } catch (e) {
+                    return null;
+                  }
+                });
+                
+                if (userInfo?.id) {
+                  console.log(`✅ 用户ID: ${userInfo.id}`);
+                }
+                
+                const response = await page.evaluate(async (userId) => {
+                  try {
+                    const headers = userId ? { 'New-Api-User': String(userId) } : {};
+                    const res = await fetch('/api/user/checkin', { method: 'POST', headers });
+                    return await res.json();
+                  } catch (e) {
+                    return { error: e.toString() };
+                  }
+                }, userInfo?.id);
+                
+                const msg = response.message || response.msg || JSON.stringify(response);
+                
+                if (response.success || msg.includes('成功') || msg.includes('已签到')) {
+                  console.log(`✅ ${msg}`);
+                  success++;
+                } else {
+                  console.log(`❌ ${msg}`);
+                  failed++;
+                }
+                
+                await context.close();
+              } catch (e) {
+                console.log(`❌ 失败: ${e.message}`);
+                failed++;
+              }
+            }
+            
+            await browser.close();
+            
+            console.log(`\n📊 签到完成: ✅ ${success} 成功, ❌ ${failed} 失败`);
+          }
+          
+          main().catch(console.error);
+          EOF
